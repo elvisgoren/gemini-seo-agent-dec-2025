@@ -5,6 +5,9 @@ import { PAUL_GRAHAM_GUIDE, ANTI_AI_GUIDE, BANNED_TERMS, CITATION_RULES } from "
 
 const getAI = () => new GoogleGenAI({ apiKey: process.env.API_KEY });
 
+const VERIFIED_SOURCES_START = "<!-- VERIFIED_SOURCES_START -->";
+const VERIFIED_SOURCES_END = "<!-- VERIFIED_SOURCES_END -->";
+
 const extractGroundingLinks = (response: any): GroundingLink[] => {
   const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
   if (!chunks) return [];
@@ -15,6 +18,36 @@ const extractGroundingLinks = (response: any): GroundingLink[] => {
       uri: chunk.web?.uri
     }))
     .filter((link: any) => link.uri);
+};
+
+const buildVerifiedSourcesBlock = (links: GroundingLink[]): string => {
+  if (!links.length) return '';
+
+  const deduped = Array.from(
+    new Map(links.map(link => [link.uri, link])).values()
+  );
+
+  return `\n${VERIFIED_SOURCES_START}\n## VERIFIED SOURCES (COPY URLS EXACTLY)
+${deduped.map((link, index) => `${index + 1}. [${link.title}](${link.uri})`).join('\n')}
+${VERIFIED_SOURCES_END}`;
+};
+
+const extractVerifiedUrlsFromResearch = (research: string): string[] => {
+  const blockRegex = new RegExp(`${VERIFIED_SOURCES_START}([\\s\\S]*?)${VERIFIED_SOURCES_END}`);
+  const blockMatch = research.match(blockRegex);
+  const sourceText = blockMatch ? blockMatch[1] : research;
+
+  const urls = sourceText.match(/https?:\/\/[^\s)]+/g) || [];
+  return Array.from(new Set(urls));
+};
+
+const stripUnverifiedMarkdownLinks = (markdown: string, allowedUrls: string[]): string => {
+  if (!allowedUrls.length) return markdown;
+
+  const allowedSet = new Set(allowedUrls);
+  return markdown.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, (full, label, url) => {
+    return allowedSet.has(url) ? full : `${label} (unverified source URL removed)`;
+  });
 };
 
 export const parseMarkdownToHTML = (md: string): string => {
@@ -255,7 +288,7 @@ Location focus: ${formData.location}
   });
   
   return {
-    text: response.text || "Research failed.",
+    text: `${response.text || "Research failed."}${buildVerifiedSourcesBlock(extractGroundingLinks(response))}`,
     links: extractGroundingLinks(response)
   };
 };
@@ -285,6 +318,12 @@ ${research}
 ${instructions ? `## USER NOTES\n${instructions}` : ''}
 
 Write a high-retention, authoritative, and helpful article. Use strict Markdown.
+
+## CITATION PROTOCOL (CRITICAL)
+- The research dossier includes a VERIFIED SOURCES block.
+- You MUST only cite URLs from that block.
+- Copy URLs character-for-character. Do NOT rewrite URL paths.
+- If a claim has no matching URL in VERIFIED SOURCES, omit the hyperlink.
 `;
 
     try {
@@ -293,7 +332,12 @@ Write a high-retention, authoritative, and helpful article. Use strict Markdown.
             contents: masterPrompt,
             config: { thinkingConfig: { thinkingBudget: 32768 } }
         });
-        return parseMarkdownToHTML(response.text || "");
+
+        const rawMarkdown = response.text || "";
+        const verifiedUrls = extractVerifiedUrlsFromResearch(research);
+        const sanitizedMarkdown = stripUnverifiedMarkdownLinks(rawMarkdown, verifiedUrls);
+
+        return parseMarkdownToHTML(sanitizedMarkdown);
     } catch (error) {
         console.error("Article generation error:", error);
         return "<p>Error generating article. Please try again.</p>";
